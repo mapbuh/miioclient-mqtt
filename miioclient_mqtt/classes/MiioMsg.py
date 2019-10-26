@@ -49,7 +49,7 @@ class MiioMsg:
     def set_arming_time(arming_time):
         return [
             "alarm/time_to_activate",
-            {"method": "set_arming_time", "params": [int(arming_time)]},
+            {"method": "set_arm_wait_time", "params": [int(arming_time)]},
             True
         ]
 

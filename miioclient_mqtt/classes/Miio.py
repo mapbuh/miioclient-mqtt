@@ -49,7 +49,7 @@ class Miio:
                     # response seem to be increased by 1,
                     # unless brightness set to 0
                     states['brightness'], states['light_rgb'] = \
-                            divmod(value-1+1, 0x1000000)
+                            divmod(value, 0x1000000)
                     states['light_rgb'] = \
                         states['light_rgb'] ^ states['brightness']
                     self.mqtt.publish(

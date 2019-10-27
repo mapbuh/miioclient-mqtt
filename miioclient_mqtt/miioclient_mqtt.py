@@ -19,6 +19,8 @@ from classes.Mqtt import Mqtt
 # Constants
 miio_len_max = 1480
 
+queue = Queue(maxsize=100)
+
 
 def read_config():
     script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -81,8 +83,10 @@ def mqtt_connect(client, userdata, flags, rc):
         userdata['mqtt'].subscribe("sound/alarming/sound")
         userdata['mqtt'].subscribe("sound/doorbell/volume")
         userdata['mqtt'].subscribe("sound/doorbell/sound")
+        userdata['mqtt'].subscribe('effect/blink')
+        userdata['mqtt'].subscribe('effect/slowblink')
     except Exception as inst:
-        print(inst.args)
+        logging.debug("Exception: " + inst.args)
 
 
 def mqtt_init(config):
@@ -153,8 +157,144 @@ def mqtt_message(client, userdata, message):
         if topic == "sound/doorbell/sound":
             if (queueAppend(queue, MiioMsg.set_doorbell_sound(command))):
                 states['doorbell_sound'] = command
+        if topic == "effect/blink":
+            # color:color:duration
+            command_parts = command.split(':', 3)
+            # states['effect']['flag'] = 1
+            states['effect'] = {}
+            states['effect']['type'] = 'blink'
+            if int(command_parts[0], 16) > 0xffffff:
+                (
+                    states['effect']['start_brightness'],
+                    states['effect']['start_color']
+                ) = divmod(int(command_parts[0], 16), 0x1000000)
+            else:
+                states['effect']['start_brightness'] = states['brightness']
+                states['effect']['start_color'] = int(command_parts[0], 16)
+            if int(command_parts[1], 16) > 0xffffff:
+                (
+                    states['effect']['target_brightness'],
+                    states['effect']['target_color']
+                ) = divmod(int(command_parts[1], 16), 0x1000000)
+            else:
+                states['effect']['target_brightness'] = states['brightness']
+                states['effect']['target_color'] = int(command_parts[1], 16)
+            states['effect']['current_color'] = states['effect']['start_color']
+            states['effect']['end_time'] = time.time() + int(command_parts[2])
+            states['effect']['active'] = True
+            states['effect']['last_iteration'] = time.time()
+            queueAppend(queue, MiioMsg.set_light('on'))
+            queueAppend(
+                queue,
+                MiioMsg.set_rgb(
+                    states['effect']['start_brightness'],
+                    states['effect']['start_color']
+                )
+            )
+        if topic == "effect/slowblink":
+            # color:pulse:duration
+            command_parts = command.split(':', 3)
+            # states['effect']['flag'] = 1
+            states['effect'] = {}
+            states['effect']['type'] = 'slowblink'
+            states['effect']['start_color'] = int('000000', 16)
+            states['effect']['target_color'] = int(command_parts[0], 16)
+            states['effect']['pulse_time'] = int(command_parts[1])
+            states['effect']['pulse_start'] = time.time()
+            states['effect']['pulse_end'] = time.time() + int(command_parts[1])
+            states['effect']['end_time'] = time.time() + int(command_parts[2])
+            states['effect']['last_iteration'] = time.time()
     except Exception as inst:
-        print(inst.args)
+        logging.debug("Exception: " + inst.args)
+
+
+def time_to_color(t0, t1, tx, c0, c1):
+    if tx >= t1:
+        return c1
+    else:
+        a = (c0 - c1) / (t0 - t1)
+        b = c1 - t1 * ((c0 - c1) / (t0 - t1))
+        return int(a * tx + b)
+
+
+def handle_effect():
+    if (states.get('effect', {}).get('end_time', 0) < time.time()):
+        states['effect']['active'] = False
+        queueAppend(queue, MiioMsg.set_light('off'))
+        return
+
+    if states['effect']['type'] == 'slowblink':
+        slowblink()
+    elif states['effect']['type'] == 'blink':
+        blink()
+    else:
+        logging.debug("Unknown effect: " + states['effect']['type'])
+
+
+def blink():
+    if (states['effect']['last_iteration'] + 0.5 > time.time()):
+        return
+    else:
+        states['effect']['last_iteration'] = time.time()
+    if states['effect']['current_color'] == states['effect']['start_color']:
+        states['light_rgb'] = states['effect']['target_color']
+        states['brightness'] = states['effect']['target_brightness']
+    else:
+        states['light_rgb'] = states['effect']['start_color']
+        states['brightness'] = states['effect']['start_brightness']
+    states['effect']['current_color'] = states['light_rgb']
+    queueAppend(
+        queue,
+        MiioMsg.set_rgb(states['brightness'], states['light_rgb'])
+    )
+
+
+def slowblink():
+    if (states['effect']['last_iteration'] + 0.5 > time.time()):
+        return
+    else:
+        states['effect']['last_iteration'] = time.time()
+    tx = time.time()
+    cx_red = time_to_color(
+            states['effect']['pulse_start'],
+            states['effect']['pulse_end'],
+            tx,
+            states['effect']['start_color'] // 0x10000 % 0x100,
+            states['effect']['target_color'] // 0x10000 % 0x100
+    )
+    cx_green = time_to_color(
+            states['effect']['pulse_start'],
+            states['effect']['pulse_end'],
+            tx,
+            states['effect']['start_color'] // 0x100 % 0x100,
+            states['effect']['target_color'] // 0x100 % 0x100
+    )
+    cx_blue = time_to_color(
+            states['effect']['pulse_start'],
+            states['effect']['pulse_end'],
+            tx,
+            states['effect']['start_color'] // 1 % 0x100,
+            states['effect']['target_color'] // 1 % 0x100
+    )
+    brightness = time_to_color(
+        states['effect']['pulse_start'],
+        states['effect']['pulse_end'],
+        tx,
+        0,
+        100
+    )
+
+    print(str(cx_red) + "/" + str(cx_green) + "/" + str(cx_blue))
+    if tx >= states['effect']['pulse_end']:
+        states['effect']['pulse_start'] = time.time()
+        states['effect']['pulse_end'] = \
+            time.time() + states['effect']['pulse_time']
+    cx = cx_red * 0x10000 + cx_green * 0x100 + cx_blue
+    print("Effect color: " + format(int(cx), 'x'))
+    queueAppend(
+        queue,
+        MiioMsg.set_rgb(brightness, int(cx))
+    )
 
 
 config = read_config()
@@ -165,7 +305,6 @@ logging.basicConfig(
 states = initial_states(config)
 mqtt = mqtt_init(config)
 miio = Miio(mqtt)
-queue = Queue(maxsize=100)
 
 # Create a UDP socket at client side
 UDPClientSocket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
@@ -210,7 +349,7 @@ while True:
             )
         except socket.timeout:
             logging.warning("No reply!")
-        UDPClientSocket.settimeout(1)
+        UDPClientSocket.settimeout(0.1)
 #    print("Waiting...")
     try:
         miio_msgs = miio.msg_decode(UDPClientSocket.recvfrom(miio_len_max)[0])
@@ -219,6 +358,9 @@ while True:
             miio.handle_msg(miio_msg, states)
     except socket.timeout:
         pass
+
+    if (states.get('effect', {}).get('active', False)):
+        handle_effect()
 
     if (time.time() - ts_last_ping) > 200:
         queue.put(MiioMsg.ping())
